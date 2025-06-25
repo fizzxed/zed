@@ -869,6 +869,12 @@ impl LanguageServer {
     }
 
     /// Sends a shutdown request to the language server process and prepares the [`LanguageServer`] to be dropped.
+    /// 
+    /// This implements the LSP shutdown protocol:
+    /// 1. Send shutdown request and wait for response (with timeout)
+    /// 2. Send exit notification
+    /// 3. Wait for process to terminate gracefully (with timeout)
+    /// 4. Force kill process if needed
     pub fn shutdown(&self) -> Option<impl 'static + Send + Future<Output = Option<()>> + use<>> {
         if let Some(tasks) = self.io_tasks.lock().take() {
             let response_handlers = self.response_handlers.clone();
@@ -883,38 +889,78 @@ impl LanguageServer {
                 &executor,
                 (),
             );
-            let exit = Self::notify_internal::<notification::Exit>(&outbound_tx, &());
-            outbound_tx.close();
 
             let server = self.server.clone();
             let name = self.name.clone();
-            let mut timer = self.executor.timer(SERVER_SHUTDOWN_TIMEOUT).fuse();
+            let mut shutdown_timer = self.executor.timer(SERVER_SHUTDOWN_TIMEOUT).fuse();
             Some(
                 async move {
-                    log::debug!("language server shutdown started");
+                    log::debug!("language server shutdown started for {name}");
 
-                    select! {
+                    // Step 1: Send shutdown request and wait for response
+                    let shutdown_successful = select! {
                         request_result = shutdown_request.fuse() => {
                             match request_result {
                                 ConnectionResult::Timeout => {
-                                    log::warn!("timeout waiting for language server {name} to shutdown");
+                                    log::warn!("timeout waiting for language server {name} shutdown response");
+                                    false
                                 },
-                                ConnectionResult::ConnectionReset => {},
-                                ConnectionResult::Result(r) => r?,
+                                ConnectionResult::ConnectionReset => {
+                                    log::debug!("language server {name} connection reset during shutdown");
+                                    true // Connection reset is acceptable during shutdown
+                                },
+                                ConnectionResult::Result(r) => {
+                                    match r {
+                                        Ok(_) => {
+                                            log::debug!("language server {name} responded to shutdown request");
+                                            true
+                                        },
+                                        Err(e) => {
+                                            log::warn!("language server {name} shutdown request failed: {e}");
+                                            false
+                                        }
+                                    }
+                                }
                             }
                         }
 
-                        _ = timer => {
-                            log::info!("timeout waiting for language server {name} to shutdown");
+                        _ = shutdown_timer => {
+                            log::warn!("timeout waiting for language server {name} shutdown response");
+                            false
                         },
+                    };
+
+                    // Step 2: Send exit notification (as per LSP spec, this should be sent after shutdown response)
+                    if shutdown_successful {
+                        log::debug!("sending exit notification to language server {name}");
+                    } else {
+                        log::debug!("sending exit notification to language server {name} after failed shutdown");
+                    }
+                    
+                    let exit_result = Self::notify_internal::<notification::Exit>(&outbound_tx, &());
+                    if let Err(e) = exit_result {
+                        log::debug!("failed to send exit notification to language server {name}: {e}");
                     }
 
+                    // Close the outbound channel to signal no more messages
+                    outbound_tx.close();
                     response_handlers.lock().take();
-                    exit?;
-                    output_done.recv().await;
-                    server.lock().take().map(|mut child| child.kill());
-                    log::debug!("language server shutdown finished");
 
+                    // Step 3: Wait for output task to complete (indicates process has closed stdin/stdout)
+                    let mut exit_timer = executor.timer(SERVER_SHUTDOWN_TIMEOUT).fuse();
+                    select! {
+                        _ = output_done.recv().fuse() => {
+                            log::debug!("language server {name} output task completed");
+                        }
+                        _ = exit_timer => {
+                            log::warn!("timeout waiting for language server {name} output task to complete");
+                        }
+                    };
+
+                    // Step 4: Kill the process to ensure cleanup
+                    server.lock().take().map(|mut child| child.kill());
+
+                    log::debug!("language server shutdown finished for {name}");
                     drop(tasks);
                     anyhow::Ok(())
                 }
